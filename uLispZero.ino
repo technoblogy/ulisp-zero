@@ -1,15 +1,10 @@
-/* uLisp Zero 1.0 - www.ulisp.com
-   David Johnson-Davies - www.technoblogy.com - 29th April 2017
+/* uLisp Zero 1.1 - www.ulisp.com
+   David Johnson-Davies - www.technoblogy.com - 18th May 2017
 
    Licensed under the MIT license: https://opensource.org/licenses/MIT
 */
 
 #include <setjmp.h>
-
-// Compile options
-
-#define printfreespace
-// #define printgcs
 
 // C Macros
 
@@ -27,15 +22,14 @@
 
 #define symbolp(x)         ((x)->type == SYMBOL)
 
-#define mark(x)            (car(x) = (object *)(((unsigned int)(car(x))) | MARKBIT))
-#define unmark(x)          (car(x) = (object *)(((unsigned int)(car(x))) & MARKMASK))
-#define marked(x)          ((((unsigned int)(car(x))) & MARKBIT) != 0)
-#define MARKBIT            0x0001
-#define MARKMASK           0xFFFE
+#define mark(x)            (car(x) = (object *)(((uintptr_t)(car(x))) | MARKBIT))
+#define unmark(x)          (car(x) = (object *)(((uintptr_t)(car(x))) & ~MARKBIT))
+#define marked(x)          ((((uintptr_t)(car(x))) & MARKBIT) != 0)
+#define MARKBIT            1
 
 // Constants
 
-enum type {ZERO=0, SYMBOL=2, PAIR=4};  // PAIR must be last
+enum type { ZERO=0, SYMBOL=2, PAIR=4 };  // PAIR must be last
 enum token { UNUSED, BRA, KET, QUO, DOT };
 
 enum function { SYMBOLS, NIL, TEE, LAMBDA, SPECIAL_FORMS, QUOTE, DEFUN, DEFVAR, SETQ, IF, FUNCTIONS, NOT,
@@ -64,7 +58,7 @@ typedef struct sobject {
 typedef object *(*fn_ptr_type)(object *, object *);
 
 typedef struct {
-  const char *string;
+  PGM_P string;
   fn_ptr_type fptr;
   int min;
   int max;
@@ -73,7 +67,7 @@ typedef struct {
 // Workspace - sizes in bytes
 #define WORDALIGNED __attribute__((aligned (2)))
 #define BUFFERSIZE 18
-#define WORKSPACESIZE 315               /* Cells (4*bytes) */
+#define WORKSPACESIZE 320            /* Cells (4*bytes) */
 
 object Workspace[WORKSPACESIZE] WORDALIGNED;
 char Buffer[BUFFERSIZE];
@@ -84,25 +78,16 @@ jmp_buf exception;
 unsigned int Freespace = 0;
 char ReturnFlag = 0;
 object *Freelist;
-extern uint8_t _end;
+//extern uint8_t _end;
 
 object *GlobalEnv;
 object *GCStack = NULL;
 char LastChar = 0;
 char LastPrint = 0;
 volatile char Escape = 0;
-char PrintReadably = 1;
 
 // Forward references
 object *tee;
-object *eval (object *form, object *env);
-object *read ();
-void repl(object *env);
-void printobject (object *form);
-char *lookupbuiltin (symbol_t name);
-int lookupfn (symbol_t name);
-int builtin (char* n);
-void Display (char c);
 
 // Set up workspace
 
@@ -176,9 +161,6 @@ void sweep () {
 }
 
 void gc (object *form, object *env) {
-  #if defined(printgcs)
-  int start = Freespace;
-  #endif
   markobject(tee); 
   markobject(GlobalEnv);
   markobject(GCStack);
@@ -247,11 +229,11 @@ boolean valid40 (char *buffer) {
  return (toradix40(buffer[0]) >= 0 && toradix40(buffer[1]) >= 0 && toradix40(buffer[2]) >= 0);
 }
 
-char *name (object *obj){
-  Buffer[3] = '\0';
-  if(obj->type != SYMBOL) error(PSTR("Error in name"));
+char *name (object *obj) {
+  if(!symbolp(obj)) error(PSTR("Error in name"));
   symbol_t x = obj->name;
   if (x < ENDFUNCTIONS) return lookupbuiltin(x);
+  Buffer[3] = '\0';
   for (int n=2; n>=0; n--) {
     Buffer[n] = fromradix40(x % 40);
     x = x / 40;
@@ -260,12 +242,12 @@ char *name (object *obj){
 }
 
 int issymbol (object *obj, symbol_t n) {
-  return obj->type == SYMBOL && obj->name == n;
+  return symbolp(obj) && obj->name == n;
 }
 
 int eq (object *arg1, object *arg2) {
   int same_object = (arg1 == arg2);
-  int same_symbol = (arg1->type == SYMBOL && arg2->type == SYMBOL && arg1->name == arg2->name);
+  int same_symbol = (symbolp(arg1) && symbolp(arg2) && arg1->name == arg2->name);
   return (same_object || same_symbol);
 }
 
@@ -313,7 +295,6 @@ void dropframe (int tc, object **env) {
     while (*env != NULL && car(*env) != NULL) {
       pop(*env);
     }
-    if (*env == NULL) error(PSTR("no frame to drop"));
   } else {
     push(nil, *env);
   }
@@ -363,7 +344,7 @@ object *sp_quote (object *args, object *env) {
 object *sp_defun (object *args, object *env) {
   (void) env;
   object *var = first(args);
-  if (var->type != SYMBOL) error2(var, PSTR("is not a symbol"));
+  if (!symbolp(var)) error2(var, PSTR("is not a symbol"));
   object *val = cons(symbol(LAMBDA), cdr(args));
   object *pair = value(var->name,GlobalEnv);
   if (pair != NULL) { cdr(pair) = val; return var; }
@@ -373,7 +354,7 @@ object *sp_defun (object *args, object *env) {
 
 object *sp_defvar (object *args, object *env) {
   object *var = first(args);
-  if (var->type != SYMBOL) error2(var, PSTR("is not a symbol"));
+  if (!symbolp(var)) error2(var, PSTR("is not a symbol"));
   object *val = eval(second(args), env);
   object *pair = value(var->name,GlobalEnv);
   if (pair != NULL) { cdr(pair) = val; return var; }
@@ -516,30 +497,30 @@ const tbl_entry_t lookup_table[] PROGMEM = {
 
 // Table lookup functions
 
-int builtin(char* n){
+int builtin (char* n) {
   int entry = 0;
   while (entry < ENDFUNCTIONS) {
-    if(strcmp_P(n, (char*)pgm_read_word(&lookup_table[entry].string)) == 0)
+   if (strcmp_P(n, (PGM_P)pgm_read_word(&lookup_table[entry].string)) == 0 )
       return entry;
     entry++;
   }
   return ENDFUNCTIONS;
 }
 
-int lookupfn(symbol_t name) {
-  return pgm_read_word(&lookup_table[name].fptr);
+fn_ptr_type lookupfn (symbol_t name) {
+  return (fn_ptr_type)pgm_read_word(&lookup_table[name].fptr);
 }
 
-int lookupmin(symbol_t name) {
+int lookupmin (symbol_t name) {
   return pgm_read_word(&lookup_table[name].min);
 }
 
-int lookupmax(symbol_t name) {
+int lookupmax (symbol_t name) {
   return pgm_read_word(&lookup_table[name].max);
 }
 
 char *lookupbuiltin (symbol_t name) {
-  strcpy_P(Buffer, (char *)(pgm_read_word(&lookup_table[name].string)));
+  strcpy_P(Buffer, (PGM_P)(pgm_read_word(&lookup_table[name].string)));
   return Buffer;
 }
 
@@ -548,13 +529,12 @@ char *lookupbuiltin (symbol_t name) {
 object *eval (object *form, object *env) {
   // Enough space?
   if (Freespace < 20) gc(form, env);
-  if (_end != 0xA5) error(PSTR("Stack overflow"));
   // Escape
   if (Escape) { Escape = 0; error(PSTR("Escape!"));}
   
   if (form == NULL) return nil;
 
-  if (form->type == SYMBOL) {
+  if (symbolp(form)) {
     symbol_t name = form->name;
     if (name == NIL) return nil;
     object *pair = value(name, env);
@@ -570,7 +550,7 @@ object *eval (object *form, object *env) {
   object *args = cdr(form);
 
   // List starts with a symbol?
-  if (function->type == SYMBOL) {
+  if (symbolp(function)) {
     symbol_t name = function->name;
 
     if (name == LAMBDA) {
@@ -602,7 +582,7 @@ object *eval (object *form, object *env) {
   function = car(head);
   args = cdr(head);
  
-  if (function->type == SYMBOL) {
+  if (symbolp(function)) {
     symbol_t name = function->name;
     if (name >= ENDFUNCTIONS) error2(fname, PSTR("is not valid here"));
     if (nargs<lookupmin(name)) error2(fname, PSTR("has too few arguments"));
@@ -622,8 +602,6 @@ object *eval (object *form, object *env) {
   error2(fname, PSTR("is an illegal function")); return nil;
 }
 
-// Input/Output
-
 // Print functions
 
 void pchar (char c) {
@@ -634,22 +612,6 @@ void pchar (char c) {
 
 void pstring (char *s) {
   while (*s) pchar(*s++);
-}
-
-void printstring (object *form) {
-  if (PrintReadably) pchar('"');
-  form = cdr(form);
-  while (form != NULL) {
-    int chars = form->integer;
-    char ch = chars>>8 & 0xFF;
-    if (PrintReadably && ch == '"') pchar('\\');
-    pchar(ch);
-    ch = chars & 0xFF;
-    if (PrintReadably && ch == '"') pchar('\\');
-    if (ch) pchar(ch);
-    form = car(form);
-  }
-  if (PrintReadably) pchar('"');
 }
 
 void pfstring (PGM_P s) {
@@ -695,7 +657,7 @@ void printobject(object *form){
       printobject(form);
     }
     pchar(')');
-  } else if (form->type == SYMBOL) {
+  } else if (symbolp(form)) {
     pstring(name(form));
   } else
     error(PSTR("Error in print."));
@@ -778,20 +740,19 @@ object *read() {
   return item;
 }
 
+// Setup
+
 void initenv() {
   GlobalEnv = NULL;
   tee = symbol(TEE);
 }
-
-// Setup
 
 void setup() {
   Serial.begin(9600);
   while (!Serial);  // wait for Serial to initialize
   initworkspace();
   initenv();
-  _end = 0xA5;      // Canary to check stack
-  pfstring(PSTR("uLisp Zero 1.0")); pln();
+  pfstring(PSTR("uLisp Zero 1.1")); pln();
 }
 
 // Read/Evaluate/Print loop
@@ -799,9 +760,7 @@ void setup() {
 void repl(object *env) {
   for (;;) {
     gc(NULL, env);
-    #if defined (printfreespace)
     pint(Freespace);
-    #endif
     pfstring(PSTR("> "));
     object *line = read();
     if (line == (object *)KET) error(PSTR("Unmatched right bracket"));
@@ -817,11 +776,6 @@ void repl(object *env) {
 }
 
 void loop() {
-  if (!setjmp(exception)) {
-    #if defined(resetautorun)
-    autorunimage();
-    #endif
-  }
+  setjmp(exception);
   repl(NULL);
 }
-
